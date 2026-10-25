@@ -1,0 +1,1475 @@
+---
+title: "ECOM5002 Group Project – Technical Appendix"
+subtitle: "Optimal Investment Strategy for John and Mary Davis"
+author: "Student 1: Chanda Bhargav Raj (23752009)  |  Student 2: Ramkumar Arumugam (23811719)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5)
+```
+
+# Group information
+
+* **Student 1** (A1–A3): Chanda Bhargav Raj, 23752009
+* **Student 2** (B1–B3): Ramkumar Arumugam, 23811719
+* **Joint** (J1–J4 and the Project Report): both students
+* **Assigned stocks:** AWR, BBY, CMCSA, COP, ELA, KR, MCD, MSFT, NEU, SLB
+
+```{r packages}
+pkgs <- c("quantmod", "xts", "zoo", "ggplot2", "knitr", "quadprog", "tseries", "moments")
+missing_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) install.packages(missing_pkgs)
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+# J1 Data Preparation (Joint)
+
+# J1.1 Download
+
+Adjusted prices are revised by Yahoo whenever dividends and splits are reprocessed, so the raw downloads are
+saved once to `data_snapshot.rds` and reused on every later run. This keeps every number in the appendix and
+the report identical. Deleting the file forces a fresh download.
+
+```{r j1-download}
+tickers    <- c("AWR", "BBY", "CMCSA", "COP", "ELA", "KR", "MCD", "MSFT", "NEU", "SLB")
+start_date <- as.Date("2014-12-01")
+end_date   <- as.Date("2026-09-01")
+snapshot   <- "data_snapshot.rds"
+
+if (file.exists(snapshot)) {
+  snap          <- readRDS(snapshot)
+  daily_list    <- snap$daily_list
+  ff_raw        <- snap$ff_raw
+  download_date <- snap$download_date
+} else {
+  get_adjusted <- function(tk) {
+    x <- tryCatch(getSymbols(tk, src = "yahoo", from = start_date, to = end_date,
+                             auto.assign = FALSE),
+                  error = function(e) NULL)
+    if (is.null(x)) NULL else Ad(x)
+  }
+  daily_list <- setNames(lapply(tickers, get_adjusted), tickers)
+
+  failed <- tickers[sapply(daily_list, is.null)]
+  if (length(failed) > 0) stop("Download failed for: ", paste(failed, collapse = ", "))
+
+  ff_raw <- tryCatch(getSymbols("FEDFUNDS", src = "FRED", auto.assign = FALSE),
+                     error = function(e) NULL)
+  if (is.null(ff_raw)) {
+    # Fallback: CSV saved manually from https://fred.stlouisfed.org/series/FEDFUNDS
+    ff_csv <- read.csv("FEDFUNDS.csv")
+    ff_raw <- xts(ff_csv[[2]], order.by = as.Date(ff_csv[[1]]))
+  }
+
+  download_date <- Sys.Date()
+  saveRDS(list(daily_list = daily_list, ff_raw = ff_raw, download_date = download_date), snapshot)
+}
+
+cat("Data downloaded on:", format(download_date), "\n")
+```
+
+# J1.2 Download audit
+
+```{r j1-audit}
+data_log <- data.frame(
+  Ticker         = tickers,
+  First_date     = as.Date(sapply(daily_list, function(x) as.character(start(x)))),
+  Last_date      = as.Date(sapply(daily_list, function(x) as.character(end(x)))),
+  Daily_obs      = sapply(daily_list, nrow),
+  Missing_prices = sapply(daily_list, function(x) sum(is.na(x))),
+  row.names = NULL
+)
+kable(data_log, caption = "Table J1.1: Daily adjusted-price download audit")
+```
+
+All ten series were downloaded successfully from Yahoo Finance as adjusted closing prices, which account for
+dividends and stock splits. Each series covers 1 December 2014 to 31 August 2026 (2,954 trading days) with no
+missing observations, so the series are aligned on identical trading dates. Yahoo treats the end date
+(1 September 2026) as exclusive, so no September 2026 data were returned. Two tickers were checked for
+corporate changes: Envela (ELA, formerly DGSE Companies) and SLB (formerly Schlumberger, ticker unchanged).
+Yahoo provides continuous adjusted histories for both, so no manual adjustment was required.
+
+# J1.3 Monthly prices and incomplete months
+
+Monthly observations are the last adjusted price of each calendar month. The December 2014 month-end price is
+the base for the January 2015 return. Any September 2026 observation would be an incomplete month and is
+removed, so August 2026 is the final completed month. The filter is kept as a safeguard even though Table J1.1
+shows that no September data were downloaded.
+
+```{r j1-monthly}
+month_end <- function(x) {
+  m <- x[endpoints(x, on = "months")]
+  index(m) <- as.yearmon(index(m))
+  m
+}
+
+prices_m <- do.call(merge, lapply(daily_list, month_end))
+colnames(prices_m) <- tickers
+
+last_full_month <- as.yearmon("2026-08")
+prices_m <- prices_m[index(prices_m) <= last_full_month]
+
+stopifnot(start(prices_m) == as.yearmon("2014-12"))
+colSums(is.na(prices_m))
+```
+
+# J1.4 Arithmetic monthly returns
+
+$r_{i,t} = (P_{i,t} - P_{i,t-1}) / P_{i,t-1}$
+
+```{r j1-returns}
+returns_m <- prices_m / lag.xts(prices_m, k = 1) - 1
+returns_m <- returns_m[-1, ]
+
+colSums(is.na(returns_m))
+
+zero_idx <- which(coredata(returns_m) == 0, arr.ind = TRUE)
+kable(data.frame(Month  = format(index(returns_m)[zero_idx[, "row"]]),
+                 Ticker = colnames(returns_m)[zero_idx[, "col"]]),
+      caption = "Table J1.2: Months with an exactly zero return")
+```
+
+```{r j1-slb-check}
+# SLB's zero-return month (July 2025) checked against daily prices
+daily_list$SLB["2025-06-25/2025-07-03"]
+daily_list$SLB["2025-07-25/2025-08-05"]
+```
+
+Five monthly returns are exactly zero. The four ELA cases (Aug 2016, Jan 2017, Jul 2018, Dec 2021) are
+consistent with infrequent trading in this small-cap stock, where the month-end price repeats the last traded
+price. The SLB case (Jul 2025, validation sample) was checked against daily prices: trading was normal on the
+surrounding days, and the stock closed at an identical price on 30 June and 31 July 2025, with no dividend in
+between. All five observations are therefore genuine and were retained, because deleting real observations
+would bias return and volatility estimates.
+
+# J1.5 Risk-free rate
+
+FEDFUNDS is the monthly average of the daily effective Federal Funds Rate, quoted in percent per annum. It is
+converted to a monthly decimal return by geometric de-annualisation:
+
+$r_{f,t} = (1 + FF_t/100)^{1/12} - 1$
+
+The rate for month *t* (the average over month *t*) is matched to the stock return earned over month *t*.
+
+```{r j1-riskfree}
+ff <- ff_raw
+index(ff) <- as.yearmon(index(ff))
+ff <- ff[index(ff) >= as.yearmon("2015-01") & index(ff) <= last_full_month]
+
+rf_m <- (1 + ff / 100)^(1 / 12) - 1
+colnames(rf_m) <- "RF"
+
+rows <- c(1, 60, 120, nrow(ff))
+kable(data.frame(Month            = format(index(ff))[rows],
+                 FF_annual_pct    = round(as.numeric(ff)[rows], 2),
+                 RF_geometric_pct = round(100 * as.numeric(rf_m)[rows], 4),
+                 RF_simple_pct    = round(as.numeric(ff)[rows] / 12, 4)),
+      caption = "Table J1.3: Federal Funds Rate conversion examples (monthly %)")
+```
+
+The geometric conversion compounds back to the quoted annual rate over twelve months and puts the risk-free
+return in the same units as the monthly stock returns. The simple method (FF/12) gives almost identical values,
+with a maximum difference of about 0.007 percentage points per month, so the choice has no material effect on
+risk-adjusted performance. The risk-free rate ranged from near zero in 2015 to about 0.37% per month in late
+2024.
+
+# J1.6 Aligned dataset and sample split
+
+```{r j1-split}
+data_all <- merge(returns_m, rf_m, join = "inner")
+
+est <- data_all[index(data_all) <= as.yearmon("2024-12")]
+val <- data_all[index(data_all) >= as.yearmon("2025-01")]
+
+stopifnot(nrow(est) == 120, !anyNA(data_all))
+
+kable(data.frame(Sample = c("Estimation", "Validation"),
+                 Start  = c(format(start(est)), format(start(val))),
+                 End    = c(format(end(est)), format(end(val))),
+                 Months = c(nrow(est), nrow(val))),
+      caption = "Table J1.4: Estimation and validation samples")
+
+R_est <- est[, tickers]; rf_est <- est[, "RF"]
+R_val <- val[, tickers]; rf_val <- val[, "RF"]
+
+write.zoo(prices_m, "monthly_adjusted_prices.csv", sep = ",")
+write.zoo(data_all, "monthly_returns_and_rf.csv", sep = ",")
+```
+
+The estimation sample (January 2015 – December 2024, 120 months) is used for all estimation and portfolio
+construction. The validation sample (January 2025 – August 2026, 20 months) is held back and used only in J3
+to evaluate portfolios whose weights have already been frozen.
+
+# J1.7 Shared objects and functions
+
+These objects and helper functions are used by every later section. All are built from the estimation sample;
+the validation matrices are created here but not used until J3.
+
+```{r j1-shared}
+Rm     <- coredata(R_est)
+Rv     <- coredata(R_val)
+rf_vec <- as.numeric(rf_est)
+rfv    <- as.numeric(rf_val)
+k      <- length(tickers)
+mu     <- colMeans(Rm)
+Sigma  <- cov(Rm)
+
+# Long-only portfolio optimiser (quadratic programming)
+#   lambda = NULL, target = NULL : minimum variance
+#   lambda = value               : maximise w'mu - (lambda/2) w'Sigma w
+#   target = value               : minimum variance for a given expected return
+optimise <- function(Sigma, mu = NULL, lambda = NULL, target = NULL, cap = 1) {
+  k    <- ncol(Sigma)
+  Amat <- matrix(1, k, 1); bvec <- 1; meq <- 1
+  if (!is.null(target)) { Amat <- cbind(Amat, mu); bvec <- c(bvec, target); meq <- 2 }
+  Amat <- cbind(Amat, diag(k)); bvec <- c(bvec, rep(0, k))
+  if (cap < 1) { Amat <- cbind(Amat, -diag(k)); bvec <- c(bvec, rep(-cap, k)) }
+  if (is.null(lambda)) { D <- 2 * Sigma; dv <- rep(0, k) } else { D <- lambda * Sigma; dv <- mu }
+  w <- solve.QP(D, dv, Amat, bvec, meq = meq)$solution
+  w[abs(w) < 1e-8] <- 0
+  setNames(w / sum(w), colnames(Sigma))
+}
+
+# Performance of fixed weights, rebalanced monthly
+port_stats <- function(w, R, rf) {
+  rp     <- as.numeric(R %*% w)
+  ex     <- rp - rf
+  wealth <- cumprod(1 + rp)
+  c(Mean_pct        = 100 * mean(rp),
+    SD_pct          = 100 * sd(rp),
+    Sharpe          = mean(ex) / sd(ex),
+    Ann_Mean_pct    = 1200 * mean(rp),
+    Ann_SD_pct      = 100 * sqrt(12) * sd(rp),
+    Ann_Sharpe      = sqrt(12) * mean(ex) / sd(ex),
+    Cumulative_pct  = 100 * (prod(1 + rp) - 1),
+    Worst_month_pct = 100 * min(rp),
+    Max_DD_pct      = 100 * min(wealth / cummax(wealth) - 1),
+    HHI             = sum(w^2),
+    Effective_N     = 1 / sum(w^2))
+}
+stats_table <- function(ports, R, rf) t(sapply(ports, port_stats, R = R, rf = rf))
+
+port_cols <- c("Mean_pct", "SD_pct", "Sharpe", "Ann_Mean_pct", "Ann_SD_pct", "Ann_Sharpe",
+               "Worst_month_pct", "Max_DD_pct", "HHI", "Effective_N")
+port_digits <- c(2, 2, 3, 1, 1, 2, 1, 1, 3, 1)
+
+# Formatting helpers for numbers quoted in the text
+fmt <- function(x, d = 2) formatC(as.numeric(x), format = "f", digits = d)
+fp  <- function(p) if (p < 0.001) "< 0.001" else formatC(p, format = "f", digits = 3)
+lst <- function(x) if (length(x) == 0) "none" else paste(x, collapse = ", ")
+```
+
+# Student 1 – Individual Tasks (A1–A3)
+# A1 Return and Volatility Analysis
+
+```{r a1-measures}
+ex_est   <- Rm - rf_vec
+mean_m   <- colMeans(Rm)
+sd_m     <- apply(Rm, 2, sd)
+sharpe_m <- colMeans(ex_est) / apply(ex_est, 2, sd)
+geo_m    <- apply(1 + Rm, 2, prod)^(1 / nrow(Rm)) - 1
+worst_m  <- apply(Rm, 2, min)
+max_dd   <- apply(Rm, 2, function(r) { w <- cumprod(1 + r); min(w / cummax(w) - 1) })
+
+a1_monthly <- data.frame(Ticker       = tickers,
+                         Mean_pct     = 100 * mean_m,
+                         Geo_mean_pct = 100 * geo_m,
+                         SD_pct       = 100 * sd_m,
+                         Sharpe       = sharpe_m)
+kable(a1_monthly[order(-a1_monthly$Sharpe), ], digits = c(0, 2, 2, 2, 3), row.names = FALSE,
+      caption = "Table A1.1: Monthly return, volatility and Sharpe ratio (estimation sample, ranked by Sharpe)")
+
+a1_annual <- data.frame(Ticker           = tickers,
+                        Ann_Mean_pct     = 1200 * mean_m,
+                        Ann_SD_pct       = 100 * sqrt(12) * sd_m,
+                        Ann_Sharpe       = sqrt(12) * sharpe_m,
+                        Worst_month_pct  = 100 * worst_m,
+                        Max_drawdown_pct = 100 * max_dd)
+kable(a1_annual[order(-a1_annual$Ann_Sharpe), ], digits = c(0, 1, 1, 2, 1, 1), row.names = FALSE,
+      caption = "Table A1.2: Annualised measures and downside risk (estimation sample)")
+```
+
+```{r a1-plot, fig.cap = "Figure A1.1: Risk-return trade-off, 2015-2024"}
+plot_df <- data.frame(Ticker = tickers, SD = 100 * sd_m, Mean = 100 * mean_m, Sharpe = sharpe_m)
+
+ggplot(plot_df, aes(SD, Mean)) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linetype = "dashed", colour = "grey50") +
+  geom_smooth(data = subset(plot_df, Ticker != "ELA"), method = "lm", formula = y ~ x, se = FALSE,
+              linetype = "dotted", colour = "steelblue", linewidth = 1) +
+  geom_point(aes(colour = Sharpe), size = 3.5) +
+  geom_text(aes(label = Ticker), vjust = -1, size = 3.2) +
+  scale_colour_gradient(low = "firebrick", high = "darkgreen") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+  labs(x = "Volatility (monthly standard deviation, %)", y = "Average monthly return (%)",
+       colour = "Sharpe ratio\n(monthly)",
+       caption = "Dashed grey: trend for all 10 stocks. Dotted blue: trend excluding ELA.") +
+  theme_minimal()
+```
+
+```{r a1-correlation}
+cor.test(plot_df$SD, plot_df$Mean)
+with(subset(plot_df, Ticker != "ELA"), cor.test(SD, Mean))
+```
+
+```{r a1-extremes}
+extremes <- function(tk) {
+  d <- data.frame(Ticker = tk, Month = format(index(R_est)), Return_pct = 100 * Rm[, tk])
+  d <- d[order(d$Return_pct), ]
+  rbind(head(d, 2), tail(d, 2))
+}
+kable(do.call(rbind, lapply(c("ELA", "SLB", "COP"), extremes)), digits = 1, row.names = FALSE,
+      caption = "Table A1.3: Two worst and two best months (estimation sample)")
+
+kable(data.frame(Ticker = tickers, Value_of_1 = apply(1 + Rm, 2, prod)), digits = 2, row.names = FALSE,
+      caption = "Table A1.4: Value at Dec 2024 of 1 dollar invested at end of Dec 2014")
+```
+# A1 Interpretation
+
+**What the measures capture.** All measures use the estimation sample only (Jan 2015 – Dec 2024), because the
+validation sample may not be used for stock screening. The average (arithmetic mean) monthly return measures
+the typical one-month gain an investor earned. Volatility (the standard deviation of monthly returns)
+measures how widely returns spread around that average, that is, how bumpy and unpredictable the ride is. The
+Sharpe ratio divides the average return in excess of the Federal Funds Rate by the volatility of that excess
+return. It measures reward per unit of risk, so stocks with very different risk levels can be compared fairly.
+Two further measures matter for retirees. The geometric mean is the growth rate actually achieved through
+compounding. The maximum drawdown is the largest fall from a previous peak, which is the closest measure to
+John's fear of "significant losses".
+
+**Attractive and unattractive stocks.** MSFT is the most attractive stock on almost every measure: the highest
+Sharpe ratio (0.32 monthly, 1.11 annualised), the highest compound growth (1.98% per month) and only moderate
+volatility (6.3%). MCD is the most defensive stock. It has the lowest volatility (4.9%), the smallest maximum
+drawdown (−23.2%) and the second-highest Sharpe ratio (0.23). Over the decade, MCD turned \$1 into \$3.99, the
+third-best result of all ten stocks (behind only MSFT and ELA), while carrying the lowest volatility. AWR, a
+regulated water utility, also combines low volatility (5.6%) with a modest drawdown. At the other end, SLB is
+clearly unattractive: high volatility (11.9%), the worst drawdown (−83.0%) and a Sharpe ratio close to zero.
+Its negative geometric mean (−0.44%) means \$1 invested in 2015 was worth only \$0.59 by December 2024
+(Table A1.4), despite a positive arithmetic average. COP shows a similar but milder pattern. NEU and CMCSA have
+low to moderate risk but deliver little return, so their Sharpe ratios are low.
+
+**Is higher return associated with higher risk?** Across all ten stocks, the correlation between volatility and
+average return is positive and significant at the 5% level (r = 0.67, p = 0.036). However, Figure A1.1 shows
+this result is driven by a single extreme observation, ELA. With ELA excluded, the correlation becomes negative
+and insignificant (r = −0.25, p = 0.51; 95% CI −0.78 to 0.50). For the remaining nine stocks, extra volatility
+was therefore not rewarded with extra return over this period. This is consistent with finance theory:
+investors are compensated for *systematic* (market-wide) risk, not for total volatility. Much of SLB's and
+COP's volatility came from oil-sector shocks (for example, −50.2% and −36.4% in March 2020), and much of ELA's
+came from company-specific jumps. Both are largely diversifiable, so neither should be expected to earn a
+reward. With only ten stocks and one decade of data, the relationship is also estimated very imprecisely, as
+the wide confidence intervals show.
+
+**Relevance to John and Mary.** John's capital-preservation goal favours low volatility, mild worst months and
+small drawdowns, which points to MCD, AWR, MSFT and NEU. ELA, SLB and COP are unsuitable for him: each lost
+more than 60% from peak to trough at some point. Mary's growth goal favours higher average and compound returns,
+which points to MSFT and, to a lesser extent, BBY and MCD. MSFT is notable because it appeals to both: it
+delivered the strongest growth without exceptional risk. This suggests the couple's preferences may conflict
+less than expected for this stock set.
+
+**Why the highest-return stock is not automatically the best.** ELA has by far the highest arithmetic mean
+(3.62% per month), but it is not the best investment, for four reasons.
+
+1. *Volatility drag:* with 20.9% monthly volatility, large losses compound badly. Its geometric mean (1.49%) is
+   below MSFT's (1.98%), so \$1 grew to \$5.89 in ELA but to \$10.57 in MSFT (Table A1.4).
+2. *Fragility:* the average is driven by a handful of extreme months (+80.6% in June 2019, +69.9% in June 2020,
+   −69.2% in May 2015), so it is a very unreliable guide to future returns (see the wide confidence interval
+   in A2).
+3. *Downside:* an −82.1% drawdown would be devastating for retirees drawing income, who may be forced to sell
+   at the bottom.
+4. *Portfolio perspective:* the value of a stock depends not on its stand-alone return but on how it combines
+   with the others through covariances. That is examined in B1 and A3.
+
+# A2 Expected Returns, Interval Estimation and Normality
+
+```{r a2-intervals}
+n      <- nrow(Rm)
+t_crit <- qt(0.975, df = n - 1)
+se_m   <- sd_m / sqrt(n)
+
+a2_ci <- data.frame(Ticker        = tickers,
+                    Mean_pct      = 100 * mean_m,
+                    Variance_pct2 = 10000 * sd_m^2,
+                    SD_pct        = 100 * sd_m,
+                    SE_pct        = 100 * se_m,
+                    CI_lower_pct  = 100 * (mean_m - t_crit * se_m),
+                    CI_upper_pct  = 100 * (mean_m + t_crit * se_m),
+                    CI_width_pct  = 100 * 2 * t_crit * se_m)
+a2_ci$Excludes_zero <- ifelse(a2_ci$CI_lower_pct > 0, "Yes", "No")
+
+kable(a2_ci, digits = c(0, 2, 2, 2, 3, 2, 2, 2, 0), row.names = FALSE,
+      caption = paste0("Table A2.1: Expected monthly returns with 95% confidence intervals (n = ", n,
+                       ", t critical = ", round(t_crit, 3), ")"))
+
+# Cross-check one interval against R's built-in t-test
+t.test(Rm[, "MSFT"])$conf.int * 100
+```
+
+```{r a2-ciplot, fig.cap = "Figure A2.1: 95% confidence intervals"}
+ggplot(a2_ci, aes(x = reorder(Ticker, Mean_pct), y = Mean_pct)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(aes(ymin = CI_lower_pct, ymax = CI_upper_pct), width = 0.3) +
+  geom_point(size = 3, colour = "steelblue") +
+  coord_flip() +
+  labs(x = NULL, y = "Expected monthly return (%), point estimate and 95% CI") +
+  theme_minimal()
+```
+
+```{r a2-normality}
+sw <- lapply(tickers, function(tk) shapiro.test(Rm[, tk]))
+jb <- lapply(tickers, function(tk) jarque.bera.test(Rm[, tk]))
+
+norm_tab <- data.frame(Ticker          = tickers,
+                       Skewness        = apply(Rm, 2, moments::skewness),
+                       Excess_kurtosis = apply(Rm, 2, moments::kurtosis) - 3,
+                       SW_W            = sapply(sw, function(t) t$statistic),
+                       SW_p            = sapply(sw, function(t) t$p.value),
+                       JB_stat         = sapply(jb, function(t) t$statistic),
+                       JB_p            = sapply(jb, function(t) t$p.value),
+                       row.names = NULL)
+norm_tab$Normality_5pct <- ifelse(norm_tab$SW_p > 0.05 & norm_tab$JB_p > 0.05, "Not rejected", "Rejected")
+norm_tab$SW_p <- ifelse(norm_tab$SW_p < 0.0001, "<0.0001", sprintf("%.4f", norm_tab$SW_p))
+norm_tab$JB_p <- ifelse(norm_tab$JB_p < 0.0001, "<0.0001", sprintf("%.4f", norm_tab$JB_p))
+
+kable(norm_tab, digits = 3, row.names = FALSE,
+      caption = "Table A2.2: Skewness, excess kurtosis, Shapiro-Wilk and Jarque-Bera tests (estimation sample)")
+```
+
+```{r a2-qq, fig.height = 6, fig.cap = "Figure A2.2: Normal Q-Q plots"}
+qq_df <- data.frame(Ticker = rep(tickers, each = n), Return = 100 * as.vector(Rm))
+
+ggplot(qq_df, aes(sample = Return)) +
+  stat_qq(size = 0.8, colour = "steelblue") +
+  stat_qq_line(colour = "firebrick") +
+  facet_wrap(~ Ticker, ncol = 5, scales = "free") +
+  labs(x = "Theoretical normal quantiles", y = "Sample quantiles (monthly return, %)") +
+  theme_minimal()
+```
+
+```{r a2-bootstrap}
+set.seed(5002)
+boot_ci <- t(apply(Rm, 2, function(r) {
+  boot_means <- replicate(5000, mean(sample(r, replace = TRUE)))
+  100 * quantile(boot_means, c(0.025, 0.975))
+}))
+
+kable(data.frame(Ticker     = tickers,
+                 t_lower    = a2_ci$CI_lower_pct, t_upper    = a2_ci$CI_upper_pct,
+                 boot_lower = boot_ci[, 1],       boot_upper = boot_ci[, 2]),
+      digits = 2, row.names = FALSE,
+      caption = "Table A2.3: t-based vs bootstrap 95% CIs for expected monthly return (%)")
+```
+
+# A2 Interpretation
+
+**Meaning of a confidence interval for expected return.** The expected return μ is the true long-run average
+monthly return of a stock, which can never be observed directly; the sample mean from 120 months is only an
+estimate of it. A 95% confidence interval gives the range of plausible values for μ given the data. Strictly,
+it means that if the sampling and interval procedure were repeated many times, about 95% of the intervals
+produced would contain the true μ. It does not mean there is a 95% probability that μ lies in this particular
+interval. Only MSFT (1.04% to 3.32%) and MCD (0.39% to 2.17%) have intervals entirely above zero (Table A2.1).
+For the other eight stocks, including ELA with the highest sample mean, we cannot be 95% confident that the true
+expected return is even positive. The heavy overlap of the intervals in Figure A2.1 also suggests that
+differences in average returns may not be statistically meaningful; this is tested formally in B2.
+
+**Why interval widths differ, and the role of volatility.** The half-width of each interval is t × s/√n. All
+stocks share the same n = 120 and t = 1.980, so width is driven entirely by volatility: each interval is about
+0.36 × its standard deviation wide. MCD, the least volatile stock, has the narrowest interval (1.78 percentage
+points), while ELA has the widest (7.55 points). Because the standard error shrinks only with √n, halving the
+width of an interval would require four times as much data (about 40 years). For highly volatile stocks, even
+a decade of history therefore says little about the true expected return.
+
+**Statistical versus economic uncertainty.** Two kinds of uncertainty must be distinguished. *Statistical
+uncertainty* concerns how precisely we know μ. Even for MSFT, the interval ranges from roughly 12% to 40% per
+year (×12), an economically enormous range for planning a retirement. Economic uncertainty is the
+month-to-month variability an investor actually experiences, measured by the standard deviation. For MCD, the
+most precisely estimated stock, a typical month could still range from about −8.6% to +11.2% (mean ± 2 SD).
+The first affects how much we can trust the optimiser's inputs; the second affects how bumpy the ride feels for
+John and Mary.
+
+**Skewness, heavy tails and extreme observations.** Skewness is mild for every stock except ELA (0.78), whose
+distribution is stretched to the right by very large positive months such as +80.6% in June 2019
+(Table A1.3). The more important departure from normality is heavy tails. COP, ELA and SLB have excess kurtosis
+between 2.5 and 3.9, compared with 0 for a normal distribution. This means extreme months, such as SLB's
+−50.2% in March 2020, occur far more often than a normal distribution predicts.
+
+**Do the formal tests and the graphs agree?** Largely, yes. Both Shapiro–Wilk and Jarque–Bera reject normality
+for COP, ELA and SLB (p < 0.001), and their Q-Q plots (Figure A2.2) show the matching pattern: points follow
+the line in the middle but peel away at both ends, with isolated extreme losses at the bottom-left. MCD is the
+one case where the tests disagree: Jarque–Bera rejects (p = 0.027) but Shapiro–Wilk does not (p = 0.129). The
+Q-Q plot explains why. MCD's distribution is close to normal apart from one or two extreme months at each end;
+Jarque–Bera focuses specifically on skewness and kurtosis, which are sensitive to such points, whereas
+Shapiro–Wilk assesses overall shape. For BBY, CMCSA, KR, MSFT and NEU, neither test rejects and the Q-Q points
+lie close to the line. Because each panel uses its own vertical scale, the plots should be compared by shape
+rather than height. Two cautions apply. First, failing to reject normality does not prove it, because with
+n = 120 the tests have limited power to detect moderate departures. Second, with ten tests at the 5% level,
+roughly one false rejection would be expected by chance alone, although COP, ELA and SLB would remain
+significant under any reasonable multiple-testing correction.
+
+**Implications for interval estimation.** The t-interval formally assumes normal returns. However, it concerns
+the sample mean, and by the Central Limit Theorem the mean of 120 observations is approximately normal even
+when individual returns are not. A bootstrap check, which makes no normality assumption, confirms this: for
+nine stocks the bootstrap intervals differ from the t-intervals by at most 0.05 percentage points
+(Table A2.3). The exception is ELA, where the right skew shifts the bootstrap interval upward (0.01% to 7.48%)
+so that its lower bound only just clears zero. Whether ELA's expected return is "significantly positive"
+therefore depends on the method chosen, which is a clear warning that its high average is not a reliable
+estimate. Both methods also assume returns are independent from month to month, which may not hold if
+volatility clusters in crisis periods.
+
+**Implications for portfolio optimisation.** Mean-variance optimisation describes each stock using only its
+expected return, variance and covariances. This is a complete description only if returns are approximately
+normal. With heavy tails, variance understates the probability of severe losses, so a portfolio that looks
+"low risk" in variance terms may still be exposed to crashes. Correlations also tend to rise in crises: COP and
+SLB both had their worst month in March 2020, so diversification can weaken exactly when it is most needed.
+Most importantly, the wide confidence intervals show that expected returns are estimated very imprecisely. An
+optimiser treats these noisy estimates as exact and tends to pile weight into stocks whose means happen to be
+overestimated, a problem often called "error maximisation". This is a key reason for basing John's
+capital-preservation portfolio in A3 on minimising variance, which does not rely on expected-return estimates
+at all, and for using weight limits to prevent extreme allocations.
+
+# A3 John's Optimal Portfolio
+
+**Objective and constraints.** John's priority is to avoid large fluctuations and significant losses, so his
+portfolio minimises portfolio variance:
+
+$$\min_{w} \; \sigma_p^2 = w^\top \Sigma w$$
+
+subject to:
+
+* $\sum_{i=1}^{10} w_i = 1$ (fully invested);
+* $w_i \ge 0$ for all $i$ (no short selling, which is unsuitable for retirees);
+* in the capped version, $w_i \le 0.30$ (no single company above 30%).
+
+$\Sigma$ is the 10 × 10 covariance matrix estimated from the estimation sample (Jan 2015 – Dec 2024). Expected
+returns are deliberately not used in the objective: A2 showed that they are estimated very imprecisely,
+whereas variances and covariances are estimated far more reliably.
+
+```{r a3-weights}
+w_gmv <- optimise(Sigma)
+w_cap <- optimise(Sigma, cap = 0.30)
+w_eq  <- setNames(rep(1 / k, k), tickers)
+w_mcd <- setNames(as.numeric(tickers == "MCD"), tickers)
+
+stopifnot(abs(sum(w_gmv) - 1) < 1e-8, all(w_gmv >= 0), all(w_cap <= 0.30 + 1e-8))
+
+kable(data.frame(Ticker            = tickers,
+                 Min_variance_pct  = 100 * w_gmv,
+                 Min_var_30cap_pct = 100 * w_cap,
+                 Equal_weight_pct  = 100 * w_eq),
+      digits = 1, row.names = FALSE, caption = "Table A3.1: John's portfolio weights (%)")
+
+a3_stats <- stats_table(list("Min variance"           = w_gmv,
+                             "Min variance (30% cap)" = w_cap,
+                             "Equal weight"           = w_eq,
+                             "MCD only"               = w_mcd), Rm, rf_vec)
+kable(a3_stats[, port_cols], digits = port_digits,
+      caption = "Table A3.2: In-sample performance of John's portfolios vs benchmarks (estimation sample)")
+```
+
+```{r a3-risk}
+risk_decomp <- function(w, Sigma) {
+  cov_p <- as.numeric(Sigma %*% w)
+  var_p <- as.numeric(t(w) %*% Sigma %*% w)
+  data.frame(Ticker           = names(w),
+             Weight_pct       = 100 * w,
+             Cov_with_port    = 10000 * cov_p,
+             Beta_to_port     = cov_p / var_p,
+             Risk_contrib_pct = 100 * w * cov_p / var_p)
+}
+kable(risk_decomp(w_gmv, Sigma), digits = c(0, 1, 2, 3, 1), row.names = FALSE,
+      caption = "Table A3.3: Risk decomposition, minimum-variance portfolio (covariance in %^2)")
+kable(risk_decomp(w_cap, Sigma), digits = c(0, 1, 2, 3, 1), row.names = FALSE,
+      caption = "Table A3.4: Risk decomposition, minimum-variance portfolio with 30% cap (covariance in %^2)")
+```
+
+```{r a3-weights-plot, fig.cap = "Figure A3.1: John's portfolio weights"}
+a3_long <- data.frame(Ticker    = rep(tickers, 2),
+                      Portfolio = rep(c("Minimum variance", "Minimum variance, 30% cap"), each = k),
+                      Weight    = 100 * c(w_gmv, w_cap))
+
+ggplot(a3_long, aes(Ticker, Weight, fill = Portfolio)) +
+  geom_col(position = "dodge") +
+  labs(x = NULL, y = "Portfolio weight (%)", fill = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+```{r a3-check, fig.cap = "Figure A3.2: John's portfolios among random portfolios"}
+# Independent check: no random long-only portfolio should have lower volatility
+set.seed(5002)
+W       <- matrix(rexp(20000 * k), ncol = k)
+W       <- W / rowSums(W)
+rand_sd <- sqrt(rowSums((W %*% Sigma) * W))
+
+c(lowest_random_SD_pct = 100 * min(rand_sd),
+  optimiser_SD_pct     = 100 * sqrt(as.numeric(t(w_gmv) %*% Sigma %*% w_gmv)))
+
+cloud      <- data.frame(SD = 100 * rand_sd, Mean = 100 * as.numeric(W %*% mu))
+stocks_pts <- data.frame(Label = tickers, SD = 100 * sd_m, Mean = 100 * mean_m)
+port_pts   <- data.frame(Label = rownames(a3_stats),
+                         SD = a3_stats[, "SD_pct"], Mean = a3_stats[, "Mean_pct"])
+
+ggplot() +
+  geom_point(data = cloud, aes(SD, Mean), colour = "grey80", size = 0.4, alpha = 0.5) +
+  geom_point(data = stocks_pts, aes(SD, Mean), colour = "grey30") +
+  geom_text(data = stocks_pts, aes(SD, Mean, label = Label), vjust = -0.8, size = 3) +
+  geom_point(data = port_pts, aes(SD, Mean, colour = Label), size = 3.5) +
+  coord_cartesian(xlim = c(3, 13), ylim = c(0, 2.6)) +
+  labs(x = "Volatility (monthly SD, %)", y = "Expected monthly return (%)", colour = NULL,
+       caption = "Grey cloud: random long-only portfolios. The two minimum-variance points coincide (cap not binding).\nELA (SD 20.9%) lies off the chart.") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+# A3 Interpretation
+
+**Result and choice between the two versions.** The minimum-variance portfolio invests in seven of the ten
+stocks: MCD 25.0%, NEU 24.0%, AWR 21.4%, MSFT 13.8%, KR 9.0%, COP 5.1% and ELA 1.7%, with nothing in BBY, CMCSA or
+SLB (Table A3.1, Figure A3.1). The 30% cap does not bind, because the largest unconstrained weight is 25%, so the
+capped and uncapped solutions are identical (Tables A3.1 to A3.4). The cap is still reported because it is a
+sensible policy safeguard for a retiree; the fact that it is not needed shows that the optimiser has produced a
+naturally spread-out portfolio rather than a concentrated bet. This portfolio is John's optimal allocation. On the
+estimation sample it has an expected return of 1.15% per month (13.8% a year), volatility of 3.54% per month
+(12.3% a year) and a Sharpe ratio of 0.284 per month (0.99 annualised) (Table A3.2). As an independent check,
+none of 20,000 randomly generated long-only portfolios had lower volatility: the lowest was
+`r round(100 * min(rand_sd), 2)`%, compared with the optimiser's
+`r round(100 * sqrt(as.numeric(t(w_gmv) %*% Sigma %*% w_gmv)), 2)`%, and Figure A3.2 shows the portfolio on the
+left edge of every achievable combination.
+
+**Why this objective represents capital preservation.** John wants to avoid large fluctuations and significant
+losses. Portfolio variance measures exactly the size of fluctuations around the average, and smaller fluctuations
+also mean smaller losses in bad months: the portfolio's worst month was −8.5% and its largest peak-to-trough fall
+−12.3%, compared with −14.8% and −23.2% for MCD, the safest single stock (Table A3.2). The objective deliberately
+ignores expected returns. A2 showed that expected returns are estimated so imprecisely that only two stocks are
+statistically positive; an objective that chased them would be driven largely by estimation error, which is the
+opposite of what a cautious investor wants.
+
+**Why the optimiser assigns these weights.** At the minimum-variance solution, every stock that is held must
+contribute to portfolio risk at exactly the same rate. Formally, its covariance with the portfolio, (Σw)ᵢ, equals
+the portfolio variance σp², so its "beta to the portfolio" is exactly 1. If one held stock added more risk at the
+margin than another, moving a little money from the first to the second would lower total risk, so the portfolio
+could not yet be at its minimum. Table A3.3 confirms this: all seven held stocks have a covariance with the
+portfolio of 12.54 (%)², which equals the portfolio variance (3.54² ≈ 12.54), and a beta of 1.000. A direct
+consequence is that, in this portfolio, each stock's share of total risk equals its weight.
+
+**How expected returns, variances and covariances shape the solution.** Expected returns play no role in John's
+objective; only variances and covariances do. Low variance earns a large weight, which is why MCD (the lowest
+volatility, 4.9%), AWR (5.6%) and NEU (5.7%) together make up about 70% of the portfolio. NEU's place is notable:
+it has one of the lowest average returns (0.54% a month), but the optimiser does not reward return, only the
+ability to calm the portfolio. Covariance matters as much as variance. ELA is the most volatile stock (20.9% a
+month) and COP the third most volatile (10.6%), yet both receive small positive weights, because their covariance
+with the rest of the portfolio is low relative to their own volatility, so a small holding adds diversification
+rather than risk (the underlying correlations are examined in B1). By contrast, CMCSA has much lower volatility
+than COP (6.9% against 10.6%) but receives nothing, because its returns move too closely with the stocks already
+held.
+
+**Why some stocks receive zero weight.** BBY, CMCSA and SLB have betas to the portfolio above 1 (1.026, 1.059 and
+1.229; Table A3.3). Even at the optimum, each would add more risk at the margin than the stocks already held, so
+any positive weight would raise portfolio variance; with short selling ruled out, the best the optimiser can do is
+hold none. SLB is the clearest case: high volatility (11.9%) combined with the largest covariance with the
+portfolio (15.41 (%)²). The portfolio already has a small amount of energy exposure through COP.
+
+**Is the allocation genuinely conservative?** Relative to the alternatives, yes. Its volatility of 3.54% a month is
+28% lower than holding MCD alone (4.94%) and 25% lower than an equal-weighted portfolio (4.71%), and its maximum
+drawdown (−12.3%) is about half that of MCD (−23.2%). This lower risk came at little cost in return: the expected
+return (1.15%) is only slightly below equal weighting (1.30%), so the Sharpe ratio (0.284) is higher than both
+benchmarks and higher than every individual stock except MSFT (0.321). The portfolio is also reasonably
+diversified, with an effective number of holdings of 5.1 (Table A3.2). In dollar terms, on John and Mary's
+\$1.5 million, the worst month would have cost about \$128,000 and the largest fall about \$185,000.
+
+**The limitation of calling an equity-only portfolio "low risk".** "Low risk" here only means low risk compared
+with other combinations of these ten shares. An annual volatility of 12.3% is still far above that of cash or
+high-quality bonds, and a fall of \$185,000 would be a significant loss for a retired couple. Several factors
+suggest that true risk is higher than these figures show. First, the weights were chosen to minimise variance on
+this specific sample, so in-sample volatility is flattering; out-of-sample volatility is usually higher, as tested
+in J3. Second, 2015–2024 did not include a prolonged crisis of the 2008 kind, so the historical maximum drawdown may
+understate what could happen. Third, A2 showed heavy tails for several stocks, so variance understates the chance
+of extreme months, and correlations tend to rise in crises, weakening diversification exactly when it is needed.
+Finally, about 70% of the portfolio sits in three companies, so it still carries company- and sector-specific risk
+that a broader portfolio would not. For John, this allocation is a sensible conservative way to hold these shares,
+but genuine capital preservation would also require holding part of the savings outside equities, which lies
+outside the scope of this ten-stock analysis.
+
+# Student 2 – Individual Tasks (B1–B3)
+#B1 Dependence and Diversification
+
+```{r b1-correlation}
+Cor <- cor(Rm)
+kable(round(Cor, 2), caption = "Table B1.1: Correlation matrix of monthly returns (estimation sample)")
+
+upper    <- which(upper.tri(Cor), arr.ind = TRUE)
+pair_tab <- data.frame(Stock_1     = tickers[upper[, 1]],
+                       Stock_2     = tickers[upper[, 2]],
+                       Correlation = Cor[upper])
+pair_tab <- pair_tab[order(pair_tab$Correlation), ]
+
+kable(rbind(head(pair_tab, 5), tail(pair_tab, 5)), digits = 3, row.names = FALSE,
+      caption = "Table B1.2: Five lowest and five highest pairwise correlations")
+
+pair_cors  <- Cor[upper.tri(Cor)]
+avg_cor    <- mean(pair_cors)
+avg_cor_by <- (colSums(Cor) - 1) / (k - 1)
+
+c(Average_correlation = avg_cor, Negative_pairs = sum(pair_cors < 0),
+  Strong_pairs_0.7 = sum(abs(pair_cors) >= 0.7), Weak_pairs_0.3 = sum(abs(pair_cors) < 0.3))
+round(sort(avg_cor_by), 3)
+```
+
+```{r b1-heatmap, fig.height = 6, fig.cap = "Figure B1.1: Correlation heat map"}
+cor_df <- data.frame(Row = rep(tickers, times = k), Col = rep(tickers, each = k),
+                     Correlation = as.vector(Cor))
+
+ggplot(cor_df, aes(Col, Row, fill = Correlation)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", Correlation)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick", midpoint = 0, limits = c(-1, 1)) +
+  scale_x_discrete(limits = tickers) +
+  scale_y_discrete(limits = rev(tickers)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r b1-number-of-stocks, fig.cap = "Figure B1.2: Volatility and number of stocks"}
+div_tab <- do.call(rbind, lapply(1:k, function(N) {
+  combos <- combn(k, N)
+  sds <- apply(combos, 2, function(idx) {
+    w <- rep(1 / N, N)
+    sqrt(as.numeric(t(w) %*% Sigma[idx, idx, drop = FALSE] %*% w))
+  })
+  data.frame(N = N, Portfolios = ncol(combos), Mean_SD_pct = 100 * mean(sds),
+             Min_SD_pct = 100 * min(sds), Max_SD_pct = 100 * max(sds))
+}))
+kable(div_tab, digits = 2, row.names = FALSE,
+      caption = "Table B1.3: Volatility of equally weighted N-stock portfolios, all combinations (monthly SD, %)")
+
+avg_cov <- mean(Sigma[upper.tri(Sigma)])
+john_sd <- 100 * sqrt(as.numeric(t(w_gmv) %*% Sigma %*% w_gmv))
+cat("Diversification floor, sqrt(average covariance):", round(100 * sqrt(avg_cov), 2), "% per month\n")
+
+ggplot(div_tab, aes(N, Mean_SD_pct)) +
+  geom_ribbon(aes(ymin = Min_SD_pct, ymax = Max_SD_pct), fill = "grey85") +
+  geom_line(colour = "steelblue", linewidth = 1) +
+  geom_point(colour = "steelblue", size = 2) +
+  geom_hline(yintercept = 100 * sqrt(avg_cov), linetype = "dashed", colour = "grey40") +
+  annotate("point", x = sum(w_gmv > 0), y = john_sd, colour = "firebrick", size = 3) +
+  annotate("text", x = sum(w_gmv > 0), y = john_sd, label = "John (optimised weights)",
+           colour = "firebrick", vjust = 1.8, size = 3) +
+  scale_x_continuous(breaks = 1:k) +
+  labs(x = "Number of stocks (equally weighted)", y = "Portfolio volatility (monthly SD, %)",
+       caption = "Line: average over all combinations; band: lowest to highest.\nDashed: floor set by the average covariance.") +
+  theme_minimal()
+```
+
+```{r b1-two-stocks, fig.cap = "Figure B1.3: Two-stock combinations"}
+lo <- pair_tab[1, ]
+hi <- pair_tab[nrow(pair_tab), ]
+
+two_curve <- function(a, b) {
+  wa <- seq(0, 1, by = 0.01)
+  sa <- sqrt(Sigma[a, a]); sb <- sqrt(Sigma[b, b]); sab <- Sigma[a, b]
+  data.frame(Pair      = paste0(a, " & ", b, " (correlation ", sprintf("%.2f", Cor[a, b]), ")"),
+             w_a       = wa,
+             SD        = 100 * sqrt(wa^2 * sa^2 + (1 - wa)^2 * sb^2 + 2 * wa * (1 - wa) * sab),
+             SD_no_div = 100 * (wa * sa + (1 - wa) * sb))
+}
+curves <- rbind(two_curve(lo$Stock_1, lo$Stock_2), two_curve(hi$Stock_1, hi$Stock_2))
+
+ggplot(curves, aes(x = 100 * w_a)) +
+  geom_line(aes(y = SD, colour = Pair), linewidth = 1) +
+  geom_line(aes(y = SD_no_div, colour = Pair), linetype = "dashed") +
+  labs(x = "Weight in first stock of the pair (%)", y = "Portfolio volatility (monthly SD, %)", colour = NULL,
+       caption = "Solid: actual volatility. Dashed: volatility if correlation were +1 (no diversification).") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+two_tab <- do.call(rbind, lapply(list(lo, hi), function(pr) {
+  a <- pr$Stock_1; b <- pr$Stock_2
+  sd_50 <- sqrt(0.25 * Sigma[a, a] + 0.25 * Sigma[b, b] + 0.5 * Sigma[a, b])
+  sd_avg <- 0.5 * sqrt(Sigma[a, a]) + 0.5 * sqrt(Sigma[b, b])
+  data.frame(Pair = paste(a, "&", b), Correlation = Cor[a, b],
+             SD_first_pct = 100 * sqrt(Sigma[a, a]), SD_second_pct = 100 * sqrt(Sigma[b, b]),
+             SD_50_50_pct = 100 * sd_50, Weighted_avg_SD_pct = 100 * sd_avg,
+             Risk_reduction_pct = 100 * (1 - sd_50 / sd_avg))
+}))
+kable(two_tab, digits = 2, row.names = FALSE,
+      caption = "Table B1.4: Diversification benefit of a 50/50 two-stock portfolio")
+```
+
+```{r b1-decomposition}
+var_terms <- sum(w_eq^2 * diag(Sigma))
+cov_terms <- as.numeric(t(w_eq) %*% Sigma %*% w_eq) - var_terms
+total_var <- var_terms + cov_terms
+
+kable(data.frame(Component  = c("Own-variance terms", "Covariance terms", "Total portfolio variance"),
+                 Value_pct2 = 10000 * c(var_terms, cov_terms, total_var),
+                 Share_pct  = 100 * c(var_terms, cov_terms, total_var) / total_var),
+      digits = 2, row.names = FALSE,
+      caption = "Table B1.5: Variance decomposition of the equally weighted portfolio, (%)^2")
+```
+
+# B1 Interpretation
+
+**Strong, weak and negative correlation.** Correlation measures how closely two stocks' monthly returns move
+together, from −1 (they always move in opposite directions) through 0 (unrelated) to +1 (they move in lockstep).
+As a rule of thumb, correlations above 0.7 in absolute value are strong and those below 0.3 are weak. Across the
+45 pairs, the average correlation is `r fmt(avg_cor)`; `r sum(abs(pair_cors) >= 0.7)` pairs are strong,
+`r sum(abs(pair_cors) < 0.3)` are weak and `r sum(pair_cors < 0)` are negative (Table B1.1, Figure B1.1). The most
+correlated pair is `r hi$Stock_1` and `r hi$Stock_2` (`r fmt(hi$Correlation)`)`r if (setequal(c(hi$Stock_1, hi$Stock_2), c("COP", "SLB"))) ", both energy companies exposed to the same oil-price shocks" else ""`,
+and the least correlated is `r lo$Stock_1` and `r lo$Stock_2` (`r fmt(lo$Correlation)`).
+
+**Which combinations offer the greatest diversification?** The five least correlated pairs are
+`r paste0(head(pair_tab, 5)$Stock_1, " & ", head(pair_tab, 5)$Stock_2, " (", fmt(head(pair_tab, 5)$Correlation), ")", collapse = ", ")`
+(Table B1.2). Looking at each stock's average correlation with the other nine, the strongest natural diversifiers
+are `r names(sort(avg_cor_by))[1]` (`r fmt(sort(avg_cor_by)[1])`) and `r names(sort(avg_cor_by))[2]`
+(`r fmt(sort(avg_cor_by)[2])`), because their returns are least tied to the rest of the group. Combining stocks
+whose returns are driven by different forces offers far more diversification than combining stocks from the same
+sector.
+
+**Why correlation does not need to be negative.** For two stocks, portfolio variance is
+w₁²σ₁² + w₂²σ₂² + 2w₁w₂ρσ₁σ₂. Portfolio volatility equals the weighted average of the two volatilities only when
+ρ = +1; for any correlation below +1 it is lower. Table B1.4 and Figure B1.3 show this directly. A 50/50 mix of the
+least correlated pair reduces volatility by `r fmt(two_tab$Risk_reduction_pct[1], 1)`% compared with the weighted
+average of the two stocks' volatilities, and even the most correlated pair (ρ = `r fmt(hi$Correlation)`) still gains
+a `r fmt(two_tab$Risk_reduction_pct[2], 1)`% reduction. Negative correlation would give a larger benefit, but
+positive correlation below one is enough for diversification to work.
+
+**The roles of covariance, correlation and weights.** Covariance, Cov(rᵢ, rⱼ) = ρᵢⱼσᵢσⱼ, is the term that
+actually enters the portfolio variance formula; correlation is the same relationship rescaled to lie between −1
+and +1, so it can be compared across stocks with very different volatilities. Weights determine how much each term
+counts: own variances are multiplied by wᵢ², while each covariance is multiplied by 2wᵢwⱼ. With ten stocks there
+are ten variance terms but 90 covariance terms, so as holdings increase the covariances increasingly determine
+portfolio risk. In the equally weighted portfolio, own variances contribute
+`r fmt(100 * var_terms / total_var, 1)`% of total variance and covariances `r fmt(100 * cov_terms / total_var, 1)`%
+(Table B1.5).
+
+**Why adding stocks does not automatically create a large benefit.** Averaged over all possible combinations,
+equally weighted volatility falls from `r fmt(div_tab$Mean_SD_pct[1])`% per month for a single stock to
+`r fmt(div_tab$Mean_SD_pct[2])`% for two, `r fmt(div_tab$Mean_SD_pct[5])`% for five and
+`r fmt(div_tab$Mean_SD_pct[10])`% for all ten (Table B1.3, Figure B1.2). Most of the benefit comes from the first
+few additions. As more stocks are added, the own-variance terms shrink towards zero but the covariance terms do
+not, so portfolio volatility approaches a floor of about `r fmt(100 * sqrt(avg_cov))`% per month, the square root
+of the average covariance. That floor reflects market-wide risk shared by all the stocks, which no amount of
+diversification within this group can remove.
+
+**Why composition matters as much as the number of holdings.** The grey band in Figure B1.2 shows how much
+volatility varies between portfolios of the same size. With `r sum(w_gmv > 0)` stocks, equally weighted
+portfolios range from `r fmt(div_tab$Min_SD_pct[sum(w_gmv > 0)])`% to `r fmt(div_tab$Max_SD_pct[sum(w_gmv > 0)])`%
+per month, and the lowest-risk three-stock portfolio (`r fmt(div_tab$Min_SD_pct[3])`%) can be compared with the
+riskiest `r sum(w_gmv > 0)`-stock portfolio (`r fmt(div_tab$Max_SD_pct[sum(w_gmv > 0)])`%). John's optimised
+portfolio, which holds `r sum(w_gmv > 0)` stocks in unequal proportions, has a volatility of `r fmt(john_sd)`%,
+below every equally weighted combination of any size. Which stocks are held, and in what proportions, therefore
+matters at least as much as how many.
+
+# B2 Covariance Matrix and Equality of Expected Returns
+
+```{r b2-covariance}
+kable(10000 * Sigma, digits = 2,
+      caption = "Table B2.1: Covariance matrix of monthly returns, (%)^2 (estimation sample)")
+```
+
+**Hypotheses.** H0: μ1 = μ2 = … = μ10 against H1: at least one expected return differs, at the 5%
+significance level. All ten returns are observed in the same 120 months and are therefore cross-sectionally
+dependent, so the test uses Hotelling's T² on the nine differences μ1 − μj, which accounts for the full
+covariance matrix.
+
+```{r b2-hotelling}
+q    <- k - 1
+xbar <- colMeans(Rm)
+C    <- cbind(1, -diag(q))
+d    <- C %*% xbar
+
+T2     <- as.numeric(n * t(d) %*% solve(C %*% Sigma %*% t(C)) %*% d)
+F_stat <- (n - q) / ((n - 1) * q) * T2
+df1    <- q
+df2    <- n - q
+F_crit <- qf(0.95, df1, df2)
+p_val  <- pf(F_stat, df1, df2, lower.tail = FALSE)
+
+kable(data.frame(
+  Item  = c("Hotelling T-squared", "F statistic", "Degrees of freedom", "Critical F (5%)", "p-value",
+            "Decision at 5%"),
+  Value = c(fmt(T2, 3), fmt(F_stat, 3), paste0("(", df1, ", ", df2, ")"), fmt(F_crit, 3),
+            format.pval(p_val, digits = 4), ifelse(p_val < 0.05, "Reject H0", "Do not reject H0"))),
+  row.names = FALSE, caption = "Table B2.2: Hotelling's T-squared test of equal expected returns")
+
+# Check: the statistic must not depend on which set of contrasts is used
+C2 <- cbind(diag(q), -1)
+d2 <- C2 %*% xbar
+c(T2 = T2, T2_other_contrasts = as.numeric(n * t(d2) %*% solve(C2 %*% Sigma %*% t(C2)) %*% d2))
+```
+
+```{r b2-dependence}
+se_pairs <- list(c(hi$Stock_1, hi$Stock_2), c(lo$Stock_1, lo$Stock_2), c("ELA", "SLB"))
+se_tab <- do.call(rbind, lapply(se_pairs, function(pr) {
+  a <- pr[1]; b <- pr[2]
+  data.frame(Pair                   = paste(a, "-", b),
+             Correlation            = Cor[a, b],
+             Mean_diff_pct          = 100 * unname(xbar[a] - xbar[b]),
+             SE_if_independent_pct  = 100 * sqrt((Sigma[a, a] + Sigma[b, b]) / n),
+             SE_with_dependence_pct = 100 * sqrt((Sigma[a, a] + Sigma[b, b] - 2 * Sigma[a, b]) / n))
+}))
+kable(se_tab, digits = 3, row.names = FALSE,
+      caption = "Table B2.3: Standard error of a mean difference, ignoring vs allowing for dependence")
+
+# For comparison only: one-way ANOVA wrongly treats the ten series as independent samples
+aov_fit <- summary(aov(Return ~ Stock, data = data.frame(Return = as.vector(Rm),
+                                                          Stock  = factor(rep(tickers, each = n)))))
+aov_fit
+aov_p <- aov_fit[[1]][["Pr(>F)"]][1]
+```
+
+# B2 Interpretation
+
+**Hypotheses and significance level.** H0: μ1 = μ2 = … = μ10 (all ten stocks have the same expected monthly
+return) against H1: at least one expected return differs. The test is conducted at the 5% significance level using
+the estimation sample only.
+
+**Test statistic and assumptions.** Because the ten returns are observed in the same months, the test is applied to
+the nine differences μ1 − μj using Hotelling's T², T² = n(Cx̄)′(CSC′)⁻¹(Cx̄), where S is the full covariance matrix
+(Table B2.1). It is converted to an F statistic with (`r df1`, `r df2`) degrees of freedom. The test assumes that
+the monthly return vectors are independent over time, that they follow a multivariate normal distribution and
+that the covariance matrix is constant over the sample. A2 showed that COP, ELA and SLB are clearly non-normal.
+With 120 observations and only nine contrasts, the test is reasonably robust to moderate non-normality because it
+is based on sample means, but heavy tails mean the p-value should be treated as approximate. As a check, the
+statistic was recomputed with a different set of contrasts and is identical, as theory requires.
+
+**Statistic, p-value and decision.** The test gives T² = `r fmt(T2, 3)` and F = `r fmt(F_stat, 3)`, against a 5%
+critical value of `r fmt(F_crit, 3)`, with p = `r fp(p_val)` (Table B2.2).
+`r if (p_val < 0.05) "Because p is below 0.05, we reject the null hypothesis: there is statistical evidence that at least one stock's expected return differs from the others. The test does not say which stocks differ or by how much." else "Because p is above 0.05, we do not reject the null hypothesis. The data do not provide statistically significant evidence that the expected returns differ, although this does not prove that they are equal."`
+
+**Sample-mean differences versus statistically significant differences.** The sample means range from
+`r fmt(100 * min(xbar))`% per month (`r names(which.min(xbar))`) to `r fmt(100 * max(xbar))`%
+(`r names(which.max(xbar))`), a gap that looks large in economic terms. But a sample mean is only an estimate of the
+expected return: with monthly volatilities between about 5% and 21%, each mean carries a standard error of roughly
+0.45 to 1.9 percentage points (Table A2.1). A large gap between sample means can arise purely from noise, so a
+difference only becomes evidence of different expected returns when it is large relative to that uncertainty.
+`r if (p_val < 0.05) "Here the differences are large enough, taken together, to be statistically significant." else "Here, taken together, the differences are not large enough to rule out noise."`
+
+**Why cross-stock dependence matters.** The variance of a difference between two sample means is
+(σᵢ² + σⱼ² − 2σᵢⱼ)/n. Because the stocks are positively correlated, the covariance term reduces this variance, so
+differences are estimated more precisely than they would be for independent samples. For `r hi$Stock_1` and
+`r hi$Stock_2`, the standard error of the mean difference is `r fmt(se_tab$SE_with_dependence_pct[1], 3)` percentage
+points once dependence is allowed for, compared with `r fmt(se_tab$SE_if_independent_pct[1], 3)` if it were ignored
+(Table B2.3). A one-way ANOVA, which wrongly treats the ten series as independent samples, gives p =
+`r fp(aov_p)` compared with the Hotelling p = `r fp(p_val)`. Ignoring dependence therefore misstates the precision
+of the comparison. Running 45 separate pairwise t-tests instead would make things worse: at the 5% level the chance
+of at least one false rejection across 45 independent tests would be about `r fmt(100 * (1 - 0.95^45), 0)`%.
+
+**Implication for portfolio selection.**
+`r if (p_val < 0.05) "Some expected returns appear to differ, which gives an optimiser something real to work with. However, the test does not identify which stocks are genuinely better, and A2 showed that individual means are imprecise, so return-driven allocations should still be constrained, for example by weight caps." else "The data cannot reliably tell the ten stocks' expected returns apart. An optimiser that responds strongly to differences in sample means, as Mary's growth objective does, may therefore be responding largely to noise. This supports using minimum variance for John, which ignores expected returns, imposing weight caps on Mary's portfolio, and treating diversification as a sensible default when no stock can be shown to have a higher expected return."`
+
+# B3 Mary's Optimal Portfolio
+
+**Objective and constraints.** Mary accepts more risk in exchange for higher expected growth, so her portfolio
+maximises a mean-variance utility that rewards expected return and penalises variance only lightly:
+
+$$\max_{w} \; w^\top \mu - \frac{\lambda}{2} \, w^\top \Sigma w$$
+
+subject to $\sum w_i = 1$, $w_i \ge 0$ and, in the practical version, $w_i \le 0.30$. A small risk-aversion
+coefficient λ places more weight on expected return. John's minimum-variance objective is the limiting case
+λ → ∞, where only risk matters.
+
+```{r b3-sensitivity}
+lambdas <- c(1, 2, 3, 5, 10, 20)
+sens <- t(sapply(lambdas, function(l) {
+  w <- optimise(Sigma, mu, lambda = l, cap = 0.30)
+  c(lambda = l, 100 * w,
+    port_stats(w, Rm, rf_vec)[c("Ann_Mean_pct", "Ann_SD_pct", "Ann_Sharpe", "Effective_N")])
+}))
+kable(sens, digits = 1, row.names = FALSE,
+      caption = "Table B3.1: Weights (%) and performance at different risk-aversion levels (30% cap)")
+```
+
+```{r b3-mary}
+lambda_mary     <- 2
+w_mary_uncapped <- optimise(Sigma, mu, lambda = lambda_mary)
+w_mary          <- optimise(Sigma, mu, lambda = lambda_mary, cap = 0.30)
+
+stopifnot(abs(sum(w_mary) - 1) < 1e-8, all(w_mary >= 0), all(w_mary <= 0.30 + 1e-8))
+
+kable(data.frame(Ticker            = tickers,
+                 John_pct          = 100 * w_gmv,
+                 Mary_uncapped_pct = 100 * w_mary_uncapped,
+                 Mary_30cap_pct    = 100 * w_mary),
+      digits = 1, row.names = FALSE, caption = "Table B3.2: Mary's portfolio weights compared with John's (%)")
+
+b3_stats <- stats_table(list("John (min variance)" = w_gmv,
+                             "Mary (uncapped)"     = w_mary_uncapped,
+                             "Mary (30% cap)"      = w_mary,
+                             "MSFT only"           = setNames(as.numeric(tickers == "MSFT"), tickers)),
+                        Rm, rf_vec)
+kable(b3_stats[, port_cols], digits = port_digits,
+      caption = "Table B3.3: In-sample performance of Mary's portfolio vs John's and benchmarks")
+
+cov_mary <- as.numeric(Sigma %*% w_mary)
+kable(data.frame(Ticker               = tickers,
+                 Weight_pct           = 100 * w_mary,
+                 Exp_return_pct       = 100 * mu,
+                 Risk_penalty_pct     = 100 * lambda_mary * cov_mary,
+                 Marginal_utility_pct = 100 * (mu - lambda_mary * cov_mary)),
+      digits = 3, row.names = FALSE,
+      caption = "Table B3.4: Marginal utility of each stock in Mary's portfolio (monthly %)")
+```
+
+```{r b3-plot, fig.cap = "Figure B3.1: John's and Mary's weights"}
+b3_long <- data.frame(
+  Ticker    = rep(tickers, 3),
+  Portfolio = factor(rep(c("John", "Mary (uncapped)", "Mary (30% cap)"), each = k),
+                     levels = c("John", "Mary (uncapped)", "Mary (30% cap)")),
+  Weight    = 100 * c(w_gmv, w_mary_uncapped, w_mary))
+
+ggplot(b3_long, aes(Ticker, Weight, fill = Portfolio)) +
+  geom_col(position = "dodge") +
+  labs(x = NULL, y = "Portfolio weight (%)", fill = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+# B3 Interpretation
+
+**How Mary's objective differs from John's.** John's objective contains only risk: it minimises variance and
+ignores expected returns. Mary's objective includes expected return directly and subtracts a penalty for variance
+scaled by the risk-aversion coefficient λ = `r lambda_mary`. A small λ means that a higher expected return can
+justify a substantial increase in risk; John's objective is the limiting case in which λ is infinitely large.
+This is a substantive difference, not just a change of emphasis: Mary's portfolio depends on the estimated
+expected returns, whereas John's does not.
+
+**Choice of λ.** Table B3.1 shows how the portfolio changes with λ. As λ rises from 1 to 20, the annual expected
+return falls from `r fmt(sens[1, "Ann_Mean_pct"], 1)`% to `r fmt(sens[nrow(sens), "Ann_Mean_pct"], 1)`% and annual
+volatility from `r fmt(sens[1, "Ann_SD_pct"], 1)`% to `r fmt(sens[nrow(sens), "Ann_SD_pct"], 1)`%. We chose
+λ = `r lambda_mary`, at the growth end of the commonly used range of roughly 1 to 10, to reflect Mary's stated
+willingness to accept more risk for growth, while avoiding the most extreme setting. The choice is a judgement
+about Mary's preferences rather than something the data can determine.
+
+**Why the same stocks receive different weights.** At Mary's optimum, every stock held below the cap must have
+the same marginal utility, μᵢ − λ(Σw)ᵢ: its expected return minus the extra risk it adds to the portfolio
+(Table B3.4). Stocks at the cap have a higher marginal utility (the optimiser would like to hold more but is not
+allowed to), and stocks with zero weight have a lower one. Because expected returns now enter the objective, stocks
+with high sample means are rewarded even if they are volatile. Compared with John's portfolio, Mary's moves weight
+towards `r lst(names(sort((w_mary - w_gmv)[(w_mary - w_gmv) > 0.01], decreasing = TRUE)))` and away from
+`r lst(names(sort((w_mary - w_gmv)[(w_mary - w_gmv) < -0.01])))` (Table B3.2, Figure B3.1).
+`r if (any(w_mary >= 0.30 - 1e-6)) paste0("The cap is binding for ", lst(tickers[w_mary >= 0.30 - 1e-6]), ".") else "The 30% cap is not binding for any stock."`
+
+**Why a growth objective produces greater concentration.** With a low penalty on risk, the optimiser pursues the
+stocks with the highest expected return per unit of added risk and has little reason to spread money widely.
+Without a cap, Mary's portfolio puts `r fmt(100 * max(w_mary_uncapped), 1)`% in
+`r names(which.max(w_mary_uncapped))`, and its effective number of holdings is
+`r fmt(b3_stats["Mary (uncapped)", "Effective_N"], 1)`, compared with
+`r fmt(b3_stats["John (min variance)", "Effective_N"], 1)` for John (Table B3.3).
+`r if (w_mary_uncapped["ELA"] > 0.05) paste0("ELA receives ", fmt(100 * w_mary_uncapped["ELA"], 1), "% in the uncapped portfolio, even though A2 showed that its high average return is the least reliable estimate of all ten stocks; this is a clear example of an optimiser amplifying estimation error.") else ""`
+
+**The trade-off between expected return and risk.** The capped portfolio has an expected return of
+`r fmt(b3_stats["Mary (30% cap)", "Ann_Mean_pct"], 1)`% a year, compared with
+`r fmt(b3_stats["John (min variance)", "Ann_Mean_pct"], 1)`% for John, but its volatility is
+`r fmt(b3_stats["Mary (30% cap)", "Ann_SD_pct"], 1)`% a year against
+`r fmt(b3_stats["John (min variance)", "Ann_SD_pct"], 1)`%. Its worst month was
+`r fmt(b3_stats["Mary (30% cap)", "Worst_month_pct"], 1)`% and its largest fall
+`r fmt(b3_stats["Mary (30% cap)", "Max_DD_pct"], 1)`%, which on \$1.5 million would have meant a loss of about
+\$`r format(round(-15000 * b3_stats["Mary (30% cap)", "Max_DD_pct"], -3), big.mark = ",")`. Its Sharpe ratio is
+`r fmt(b3_stats["Mary (30% cap)", "Sharpe"], 3)` against `r fmt(b3_stats["John (min variance)", "Sharpe"], 3)` for John,
+`r if (b3_stats["Mary (30% cap)", "Sharpe"] > b3_stats["John (min variance)", "Sharpe"]) "so in this sample the extra risk was more than compensated by extra return." else "so each extra unit of expected return came at a proportionally higher cost in risk."`
+
+**Is the mathematical optimum reasonable for a retired investor?** The uncapped optimum is not. Placing
+`r fmt(100 * max(w_mary_uncapped), 1)`% of a couple's retirement savings in a single company exposes them to
+company-specific events that no model can anticipate, and it relies on expected-return estimates that A2 and B2
+showed to be very uncertain. Retirees who draw an income also face sequence risk: a large fall early in retirement
+forces them to sell shares at low prices, permanently reducing what is left to recover. Imposing a 30% cap is
+therefore a deliberate human judgement. The capped portfolio holds `r sum(w_mary > 0)` stocks and is more defensible,
+but its volatility and drawdown are still high for a retired couple, so it is best seen as the growth end of the
+household's range rather than as a recommendation on its own. This is why J2 builds a compromise between John's
+and Mary's portfolios.
+
+# Joint Tasks (J2–J4)
+# J2 Optimal Portfolio for the Couple
+
+**Method.** The household portfolio is a point on the long-only, 30%-capped efficient frontier between John's
+and Mary's optimal portfolios. Its target expected return is
+
+$$\mu_H = \mu_J + \alpha(\mu_M - \mu_J), \quad 0 \le \alpha \le 1,$$
+
+and its weights minimise variance subject to that target. α = 0 reproduces John's portfolio and α = 1
+reproduces Mary's.
+
+```{r j2-frontier-grid}
+mu_J <- sum(w_gmv * mu)
+mu_M <- sum(w_mary * mu)
+
+j2_grid <- t(sapply(seq(0, 1, by = 0.1), function(a) {
+  w <- optimise(Sigma, mu, target = mu_J + a * (mu_M - mu_J), cap = 0.30)
+  c(alpha = a, port_stats(w, Rm, rf_vec)[c("Ann_Mean_pct", "Ann_SD_pct", "Ann_Sharpe",
+                                           "Worst_month_pct", "Max_DD_pct", "Effective_N")])
+}))
+kable(j2_grid, digits = 2, row.names = FALSE,
+      caption = "Table J2.1: Household portfolios along the frontier from John (alpha = 0) to Mary (alpha = 1)")
+```
+
+```{r j2-household}
+alpha_h <- 0.5
+w_house <- optimise(Sigma, mu, target = mu_J + alpha_h * (mu_M - mu_J), cap = 0.30)
+w_blend <- 0.5 * w_gmv + 0.5 * w_mary
+
+kable(data.frame(Ticker          = tickers,
+                 John_pct        = 100 * w_gmv,
+                 Mary_pct        = 100 * w_mary,
+                 Household_pct   = 100 * w_house,
+                 Blend_50_50_pct = 100 * w_blend),
+      digits = 1, row.names = FALSE, caption = "Table J2.2: John, Mary and household weights (%)")
+
+j2_stats <- stats_table(list(John = w_gmv, Mary = w_mary, Household = w_house, "50/50 blend" = w_blend),
+                        Rm, rf_vec)
+kable(j2_stats[, port_cols], digits = port_digits,
+      caption = "Table J2.3: John, Mary and household portfolios compared (estimation sample)")
+
+# Weights are frozen here, before any validation data are examined
+write.csv(data.frame(Ticker = tickers, John = w_gmv, Mary = w_mary, Household = w_house),
+          "frozen_weights.csv", row.names = FALSE)
+
+risk_share <- (j2_stats["Household", "SD_pct"] - j2_stats["John", "SD_pct"]) /
+              (j2_stats["Mary", "SD_pct"] - j2_stats["John", "SD_pct"])
+shift      <- w_house - w_gmv
+moved_to   <- names(sort(shift[shift > 0.01], decreasing = TRUE))
+moved_from <- names(sort(shift[shift < -0.01]))
+```
+
+```{r j2-plot, fig.cap = "Figure J2.1: Efficient frontier and the household portfolio"}
+max_return <- function(mu, cap) {
+  w <- rep(0, length(mu)); left <- 1
+  for (i in order(mu, decreasing = TRUE)) { w[i] <- min(cap, left); left <- left - w[i] }
+  sum(w * mu)
+}
+
+frontier <- do.call(rbind, lapply(seq(mu_J, 0.995 * max_return(mu, 0.30), length.out = 40), function(tg) {
+  w <- tryCatch(optimise(Sigma, mu, target = tg, cap = 0.30), error = function(e) NULL)
+  if (is.null(w)) return(NULL)
+  data.frame(SD = 100 * sqrt(as.numeric(t(w) %*% Sigma %*% w)), Mean = 100 * tg)
+}))
+
+ggplot() +
+  geom_path(data = frontier, aes(SD, Mean), colour = "grey40", linewidth = 1) +
+  geom_point(data = stocks_pts, aes(SD, Mean), colour = "grey50") +
+  geom_text(data = stocks_pts, aes(SD, Mean, label = Label), vjust = -0.8, size = 3, colour = "grey30") +
+  geom_point(data = data.frame(Label = rownames(j2_stats), SD = j2_stats[, "SD_pct"],
+                               Mean = j2_stats[, "Mean_pct"]),
+             aes(SD, Mean, colour = Label), size = 3.5) +
+  coord_cartesian(xlim = c(3, 13), ylim = c(0, 3)) +
+  labs(x = "Volatility (monthly SD, %)", y = "Expected monthly return (%)", colour = NULL,
+       caption = "Line: long-only efficient frontier with a 30% cap. ELA lies off the chart.") +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+# J2 Interpretation
+
+**Why a point on the efficient frontier.** John and Mary share one pool of savings, so the household portfolio
+must trade John's wish for stability against Mary's wish for growth. Every point on the efficient frontier has
+the lowest possible volatility for its expected return, so moving along the frontier from John's portfolio
+towards Mary's is the cheapest way, in risk terms, to buy extra expected return. This reduces the whole
+compromise to one transparent number, α: the share of the gap between John's and Mary's expected returns that
+the household accepts (Table J2.1).
+
+**Choice of α.** We set α = `r alpha_h`. John and Mary are joint owners of the savings and neither preference has
+a stronger claim, so we began from an equal split of the expected-return gap. Table J2.1 shows what this buys and
+costs: expected annual return rises from `r fmt(j2_stats["John", "Ann_Mean_pct"], 1)`% for John to
+`r fmt(j2_stats["Household", "Ann_Mean_pct"], 1)`% for the household (Mary:
+`r fmt(j2_stats["Mary", "Ann_Mean_pct"], 1)`%), while annual volatility rises from
+`r fmt(j2_stats["John", "Ann_SD_pct"], 1)`% to `r fmt(j2_stats["Household", "Ann_SD_pct"], 1)`% (Mary:
+`r fmt(j2_stats["Mary", "Ann_SD_pct"], 1)`%). The largest historical fall moves from
+`r fmt(j2_stats["John", "Max_DD_pct"], 1)`% to `r fmt(j2_stats["Household", "Max_DD_pct"], 1)`% (Mary:
+`r fmt(j2_stats["Mary", "Max_DD_pct"], 1)`%). The value of α is a judgement about the couple's priorities, not
+an output of the optimiser, and Table J2.1 lets John and Mary see exactly what a more cautious or more
+growth-oriented balance would mean.
+
+**Mathematical relationship to the two optima.** The household weights solve John's minimum-variance problem
+with one extra constraint: the expected return must equal μ_H. Its expected return therefore lies exactly
+`r fmt(100 * alpha_h, 0)`% of the way from John's to Mary's. Its risk does not rise in proportion. Minimum
+volatility is a convex function of the target return, so the household's volatility
+(`r fmt(j2_stats["Household", "SD_pct"])`% per month) can be no higher than the average of John's
+(`r fmt(j2_stats["John", "SD_pct"])`%) and Mary's (`r fmt(j2_stats["Mary", "SD_pct"])`%). Here the household
+takes on `r fmt(100 * risk_share, 0)`% of the extra risk in Mary's portfolio to obtain
+`r fmt(100 * alpha_h, 0)`% of her extra expected return, and its Sharpe ratio is
+`r fmt(j2_stats["Household", "Sharpe"], 3)`, compared with `r fmt(j2_stats["John", "Sharpe"], 3)` for John and
+`r fmt(j2_stats["Mary", "Sharpe"], 3)` for Mary (Table J2.3).
+
+**Economic interpretation.** The first steps away from the minimum-variance portfolio are cheap: diversification
+still absorbs much of the added risk, so a meaningful share of Mary's growth can be captured before risk rises
+sharply. Compared with John's portfolio, the household moves weight towards `r lst(moved_to)` and away from
+`r lst(moved_from)` (Table J2.2). It holds `r sum(w_house > 0)` stocks, its largest holding is
+`r fmt(100 * max(w_house), 1)`% in `r names(which.max(w_house))`, and its effective number of holdings is
+`r fmt(j2_stats["Household", "Effective_N"], 1)`, against `r fmt(j2_stats["John", "Effective_N"], 1)` for John and
+`r fmt(j2_stats["Mary", "Effective_N"], 1)` for Mary.
+
+**Why this compromise is preferable to the alternatives.** A simple 50/50 blend of John's and Mary's weights has
+exactly the same expected return as the household portfolio but a volatility of
+`r fmt(j2_stats["50/50 blend", "SD_pct"])`% per month against `r fmt(j2_stats["Household", "SD_pct"])`%.
+Averaging two optimal portfolios ignores how the stocks in one interact with the stocks in the other;
+re-optimising at the same target return removes that waste, so the blend can never have lower volatility than
+the frontier portfolio. A weighted sum of the two objective functions was also considered, but John's objective
+contains no return term, so the weights on the two objectives would have no natural scale. The frontier
+approach expresses the compromise directly in units the couple can understand: how much extra expected return
+they want, and what it costs in risk. For a recently retired couple, the household portfolio keeps every holding
+at or below 30%, has lower volatility than Mary's portfolio and offers higher expected growth than John's.
+
+# J3 Out-of-Sample Validation
+
+All weights were frozen at the end of J2 and saved to `frozen_weights.csv`. The validation sample
+(January 2025 – August 2026) is used from here onward only to evaluate them.
+
+```{r j3-performance}
+final_ports <- list(John = w_gmv, Mary = w_mary, Household = w_house)
+est_tab <- stats_table(final_ports, Rm, rf_vec)
+val_tab <- stats_table(final_ports, Rv, rfv)
+n_val   <- nrow(Rv)
+
+val_cols <- c("Mean_pct", "SD_pct", "Cumulative_pct", "Sharpe", "Ann_Sharpe", "Worst_month_pct", "Max_DD_pct")
+kable(val_tab[, val_cols], digits = c(2, 2, 1, 3, 2, 1, 1),
+      caption = paste0("Table J3.1: Realised performance in the validation sample (", n_val,
+                       " months, Jan 2025 - Aug 2026)"))
+
+pred_cum <- 100 * ((1 + est_tab[, "Cumulative_pct"] / 100)^(n_val / n) - 1)
+kable(data.frame(Portfolio          = names(final_ports),
+                 Predicted_mean_pct = est_tab[, "Mean_pct"],   Realised_mean_pct = val_tab[, "Mean_pct"],
+                 Predicted_SD_pct   = est_tab[, "SD_pct"],     Realised_SD_pct   = val_tab[, "SD_pct"],
+                 Predicted_Sharpe   = est_tab[, "Sharpe"],     Realised_Sharpe   = val_tab[, "Sharpe"],
+                 Predicted_cum_pct  = pred_cum,                Realised_cum_pct  = val_tab[, "Cumulative_pct"]),
+      digits = 2, row.names = FALSE,
+      caption = "Table J3.2: Estimation-period predictions vs validation outcomes (monthly unless stated)")
+
+kable(data.frame(Ticker       = tickers,
+                 Est_mean_pct = 100 * colMeans(Rm), Val_mean_pct = 100 * colMeans(Rv),
+                 Est_SD_pct   = 100 * apply(Rm, 2, sd), Val_SD_pct = 100 * apply(Rv, 2, sd)),
+      digits = 2, row.names = FALSE,
+      caption = "Table J3.3: Individual stocks, estimation vs validation period (monthly %)")
+
+sd_v  <- val_tab[, "SD_pct"]
+cum_v <- val_tab[, "Cumulative_pct"]
+john_least_vol    <- names(which.min(sd_v)) == "John"
+mary_most_growth  <- names(which.max(cum_v)) == "Mary"
+house_between     <- sd_v["Household"]  >= min(sd_v[c("John", "Mary")])  &&
+                     sd_v["Household"]  <= max(sd_v[c("John", "Mary")])  &&
+                     cum_v["Household"] >= min(cum_v[c("John", "Mary")]) &&
+                     cum_v["Household"] <= max(cum_v[c("John", "Mary")])
+vol_ratio <- val_tab[, "SD_pct"] / est_tab[, "SD_pct"]
+held      <- tickers[w_house > 0]
+best_held <- held[which.max(colMeans(Rv)[held])]
+worst_held <- held[which.min(colMeans(Rv)[held])]
+```
+
+```{r j3-wealth, fig.cap = "Figure J3.1: Growth of 1.5 million dollars, validation period"}
+val_dates <- as.Date(index(R_val))
+wealth_df <- do.call(rbind, lapply(names(final_ports), function(nm) {
+  rp <- as.numeric(Rv %*% final_ports[[nm]])
+  data.frame(Portfolio = nm, Date = c(val_dates[1] - 1, val_dates), Value = 1.5 * c(1, cumprod(1 + rp)))
+}))
+
+ggplot(wealth_df, aes(Date, Value, colour = Portfolio)) +
+  geom_line(linewidth = 1) +
+  labs(x = NULL, y = "Portfolio value (USD million)", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+**Test of a change in expected return (household portfolio).** H0: μ_validation = μ_estimation against
+H1: μ_validation ≠ μ_estimation, at the 5% level. Welch's two-sample t-test is used because the two periods have
+very different lengths and possibly different volatilities.
+
+```{r j3-test}
+rp_h_est <- as.numeric(Rm %*% w_house)
+rp_h_val <- as.numeric(Rv %*% w_house)
+
+welch  <- t.test(rp_h_val, rp_h_est, var.equal = FALSE)
+reject <- welch$p.value < 0.05
+welch
+
+kable(data.frame(
+  Item  = c("Mean, estimation (% per month)", "Mean, validation (% per month)", "Difference (validation - estimation)",
+            "Welch t statistic", "Degrees of freedom", "p-value", "95% CI for the difference (% per month)",
+            "Decision at 5%"),
+  Value = c(fmt(100 * mean(rp_h_est), 3), fmt(100 * mean(rp_h_val), 3),
+            fmt(100 * (mean(rp_h_val) - mean(rp_h_est)), 3), fmt(welch$statistic, 3),
+            fmt(welch$parameter, 1), format.pval(welch$p.value, digits = 4),
+            paste0("(", fmt(100 * welch$conf.int[1]), ", ", fmt(100 * welch$conf.int[2]), ")"),
+            ifelse(reject, "Reject H0", "Do not reject H0"))),
+  row.names = FALSE, caption = "Table J3.4: Welch test of a change in the household portfolio's expected return")
+
+# Robustness checks
+wilcox_h  <- wilcox.test(rp_h_val, rp_h_est)
+vartest_h <- var.test(rp_h_val, rp_h_est)
+shapiro_h <- shapiro.test(rp_h_val)
+c(Wilcoxon_p = wilcox_h$p.value, F_test_variance_p = vartest_h$p.value, Shapiro_validation_p = shapiro_h$p.value)
+```
+
+# J3 Interpretation
+
+**Did each portfolio do its job?** John's portfolio
+`r if (john_least_vol) "remained the least volatile of the three" else paste0("was not the least volatile of the three; the ", names(which.min(sd_v)), " portfolio was")`,
+with realised volatility of `r fmt(sd_v["John"])`% per month (Table J3.1). Mary's portfolio
+`r if (mary_most_growth) "achieved the greatest growth" else "did not achieve the greatest growth"`, with a
+cumulative return of `r fmt(cum_v["Mary"], 1)`% over the `r n_val` months, against `r fmt(cum_v["John"], 1)`% for
+John and `r fmt(cum_v["Household"], 1)`% for the household. The household portfolio
+`r if (house_between) "stayed between John's and Mary's on both volatility and cumulative return, so it remained an economically meaningful compromise" else "did not stay between John's and Mary's on both volatility and cumulative return, so its role as a middle ground was weaker than intended over this short period"`.
+Figure J3.1 shows how a \$1.5 million investment in each portfolio would have evolved.
+
+**Were the predictions accurate?** Realised volatility was `r fmt(vol_ratio["John"])` times the predicted level
+for John, `r fmt(vol_ratio["Mary"])` times for Mary and `r fmt(vol_ratio["Household"])` times for the household
+(Table J3.2). Realised average monthly returns were `r fmt(val_tab["John", "Mean_pct"])`%,
+`r fmt(val_tab["Mary", "Mean_pct"])`% and `r fmt(val_tab["Household", "Mean_pct"])`%, against predictions of
+`r fmt(est_tab["John", "Mean_pct"])`%, `r fmt(est_tab["Mary", "Mean_pct"])`% and
+`r fmt(est_tab["Household", "Mean_pct"])`%.
+`r if (vol_ratio["Household"] > 1) "Out-of-sample volatility above the in-sample estimate is expected for optimised portfolios, because the optimiser chooses weights that happened to work well in the estimation data." else "Optimised portfolios usually look riskier out of sample than in sample, because the optimiser chooses weights that happened to work well in the estimation data, so household volatility at or below its prediction is a reassuring result, although 20 months is a short window."`
+Average returns are far noisier, and over only 20 months they can differ substantially from
+long-run expectations in either direction. Table J3.3 shows which stocks drove the outcome: among the household's
+holdings, the strongest validation performer was `r best_held`
+(`r fmt(100 * mean(Rv[, best_held]))`% a month) and the weakest was `r worst_held`
+(`r fmt(100 * mean(Rv[, worst_held]))`% a month).
+
+**Did the household portfolio's expected return change?** The Welch test compares the household's mean monthly
+return in the validation period (`r fmt(100 * mean(rp_h_val), 3)`%) with the estimation period
+(`r fmt(100 * mean(rp_h_est), 3)`%). The test statistic is t = `r fmt(welch$statistic, 3)` with
+`r fmt(welch$parameter, 1)` degrees of freedom and p = `r fp(welch$p.value)` (Table J3.4).
+`r if (reject) "At the 5% level we reject the null hypothesis: there is statistical evidence that the expected return differed between the two periods." else "At the 5% level we do not reject the null hypothesis. This does not show that the expected return stayed the same."`
+The 95% confidence interval for the change runs from `r fmt(100 * welch$conf.int[1])` to
+`r fmt(100 * welch$conf.int[2])` percentage points per month, which is
+`r if (reject) "a wide range even though it excludes zero" else "wide enough to be consistent with no change and with a large change in either direction"`.
+
+**Limitations.** Three limitations matter. First, the validation sample has only `r n_val` observations, so the
+test has little power: only very large changes in expected return could be detected. Second, monthly returns are
+not normally distributed (A2), and with 20 observations the Central Limit Theorem offers limited protection. A
+rank-based Wilcoxon test, which does not assume normality, gives p = `r fp(wilcox_h$p.value)`,
+`r if ((wilcox_h$p.value < 0.05) == reject) "which leads to the same conclusion" else "which leads to a different conclusion and so signals that the result is fragile"`.
+Third, volatility may have changed between the periods: realised household volatility was
+`r fmt(val_tab["Household", "SD_pct"])`% per month against `r fmt(est_tab["Household", "SD_pct"])`% in the
+estimation period, and an F-test of equal variances gives p = `r fp(vartest_h$p.value)`. This is why Welch's
+unequal-variance test was used, although the F-test itself is sensitive to non-normality and is only indicative.
+
+# J4 Client Recommendation and Reflection
+
+```{r j4-recommendation}
+alloc <- data.frame(Ticker     = tickers,
+                    Weight_pct = 100 * w_house,
+                    Amount_USD = round(1.5e6 * w_house))
+alloc <- alloc[alloc$Weight_pct > 0, ]
+alloc <- alloc[order(-alloc$Weight_pct), ]
+alloc <- rbind(alloc, data.frame(Ticker = "Total", Weight_pct = 100, Amount_USD = 1.5e6))
+kable(alloc, digits = c(0, 1, 0), row.names = FALSE, format.args = list(big.mark = ","),
+      caption = "Table J4.1: Recommended household allocation of USD 1.5 million (rounded to the nearest dollar)")
+
+j4_summary <- data.frame(Portfolio              = names(final_ports),
+                         Exp_return_pa_pct      = est_tab[, "Ann_Mean_pct"],
+                         Exp_volatility_pa_pct  = est_tab[, "Ann_SD_pct"],
+                         Exp_Sharpe_pa          = est_tab[, "Ann_Sharpe"],
+                         Hist_max_fall_pct      = est_tab[, "Max_DD_pct"],
+                         Val_cumulative_pct     = val_tab[, "Cumulative_pct"],
+                         Val_volatility_pa_pct  = sqrt(12) * val_tab[, "SD_pct"],
+                         Val_max_fall_pct       = val_tab[, "Max_DD_pct"])
+kable(j4_summary, digits = 2, row.names = FALSE,
+      caption = "Table J4.2: Key evidence for the recommendation (estimation 2015-2024, validation 2025-2026)")
+
+growth <- apply(1 + Rv, 2, prod)
+w_end  <- w_house * growth / sum(w_house * growth)
+drift  <- data.frame(Ticker                  = tickers,
+                     Target_pct              = 100 * w_house,
+                     Without_rebalancing_pct = 100 * w_end,
+                     Drift_pp                = 100 * (w_end - w_house))
+drift <- drift[drift$Target_pct > 0, ]
+kable(drift, digits = 1, row.names = FALSE,
+      caption = "Table J4.3: Weight drift by August 2026 if the household portfolio were never rebalanced")
+
+top3     <- head(sort(w_house[w_house > 0], decreasing = TRUE), 3)
+top3_txt <- paste0(names(top3), " (", fmt(100 * top3, 1), "%)", collapse = ", ")
+max_drift_tk <- drift$Ticker[which.max(abs(drift$Drift_pp))]
+max_drift    <- drift$Drift_pp[which.max(abs(drift$Drift_pp))]
+
+supports <- c(if (john_least_vol) "John's portfolio remained the least volatile",
+              if (house_between) "the household portfolio stayed between John's and Mary's",
+              if (!reject) "the Welch test found no statistically significant change in the household's expected return",
+              if (vol_ratio["Household"] <= 1.25) "the household's realised volatility was within 25% of its prediction")
+cautions <- c(if (!john_least_vol) "John's portfolio was not the least volatile",
+              if (!house_between) "the household portfolio did not stay between John's and Mary's",
+              if (reject) "the household's expected return appears to have changed",
+              if (vol_ratio["Household"] > 1.25) "the household's realised volatility exceeded its prediction by more than 25%",
+              "a 20-month sample is too short to confirm or overturn estimates based on ten years of data")
+```
+
+# J4 Interpretation: Recommendation
+
+**Recommended allocation.** We recommend the household portfolio in Table J4.1: `r sum(w_house > 0)` holdings,
+led by `r top3_txt`. On the estimation sample it has an expected return of
+`r fmt(est_tab["Household", "Ann_Mean_pct"], 1)`% a year and volatility of
+`r fmt(est_tab["Household", "Ann_SD_pct"], 1)`% a year (Table J4.2). It suits a recently retired couple because it
+gives Mary meaningfully higher expected growth than John's portfolio
+(`r fmt(est_tab["John", "Ann_Mean_pct"], 1)`% a year) while keeping volatility below Mary's portfolio
+(`r fmt(est_tab["Mary", "Ann_SD_pct"], 1)`% a year), and no single company exceeds 30% of the savings.
+
+**Principal benefits.** The portfolio is diversified across `r sum(w_house > 0)` companies with weights chosen to
+use the covariance between them, not just their individual risk, so it is smoother than holding any single share.
+Its largest historical fall was `r fmt(est_tab["Household", "Max_DD_pct"], 1)`%, far smaller than the falls of
+60% to 83% suffered by the riskiest individual shares (Table A1.2), and its risk-adjusted return
+(annualised Sharpe ratio `r fmt(est_tab["Household", "Ann_Sharpe"])`) compares well with the individual stocks.
+
+**Principal risks.** First, the portfolio holds only shares, so a severe market fall could still reduce its value
+substantially, and 2015–2024 did not include a prolonged crisis of the 2008 kind. Second, the inputs are uncertain:
+only MSFT and MCD have expected returns that are statistically above zero (Table A2.1), and the joint test in B2
+`r if (p_val < 0.05) "rejected" else "did not reject"` the hypothesis that all ten expected returns are equal
+(p = `r fp(p_val)`), `r if (p_val < 0.05) "so the stocks do appear to differ, but the size of each difference remains uncertain" else "so the return differences the optimiser responds to may be largely noise"`.
+Third, several stocks have heavy tails (Table A2.2), so variance understates the chance of extreme months. Finally,
+returns are in US dollars and the portfolio is concentrated in a small number of companies and sectors.
+
+**What the validation evidence tells us.** Evidence that supports the recommendation: `r lst(supports)`.
+Evidence that calls for caution: `r paste(cautions, collapse = "; ")`. Overall, the validation results
+`r if (length(supports) > length(cautions)) "modestly strengthen" else "do not strengthen"` our confidence in the
+recommendation. They are best read as a check that nothing has gone badly wrong, not as proof that the
+portfolio will continue to perform as predicted.
+
+**Implementation, monitoring and rebalancing.** Without rebalancing, the weights drift as prices move: by August
+2026 the largest drift would have been `r fmt(max_drift, 1)` percentage points in `r max_drift_tk`
+(Table J4.3). We therefore recommend rebalancing to the target weights every quarter, or sooner if any holding
+drifts more than 5 percentage points from its target, taking transaction costs and tax into account. The
+portfolio should be re-estimated once a year with the latest data, with correlations and volatility monitored
+for signs of a regime change, and reviewed immediately if it falls more than about 15% from its peak or if the
+couple's circumstances change. Because John's priority is protecting capital, we also suggest holding one to
+two years of planned spending in cash or high-quality bonds outside this share portfolio, so the couple is never
+forced to sell shares after a market fall.
+
+# J4 Reflection
+
+**Role of AI.** We used an AI assistant (Claude) to help plan the workflow, draft R code for each task and
+produce first drafts of the written interpretation. The assistant did not have access to our data or to RStudio:
+every chunk was run by us, and every number in this appendix comes from our own R output. Interpretations were
+revised against our results before being included.
+
+**How AI-assisted work was independently validated.** We did not accept AI output on trust. Concrete checks
+included: recalculating the MSFT confidence interval with R's built-in `t.test()`, which matched Table A2.1
+exactly; comparing the t-intervals with bootstrap intervals that do not assume normality (Table A2.3); checking
+the minimum-variance solution against 20,000 random portfolios and confirming that every held stock has a beta to
+the portfolio of exactly 1, as theory requires (Table A3.3); recomputing Hotelling's T² with a different set of
+contrasts, which must give the same statistic (B2); tracing every zero-return month and checking SLB's July 2025
+result against daily prices (J1); asserting sample sizes, weight sums and caps in code with `stopifnot()`; and
+saving the frozen weights before any validation data were used. These checks also caught an error: an AI-drafted
+statement described MCD's ten-year growth as the second-best of the ten stocks, but Table A1.4 shows it was
+third, behind MSFT and ELA, and the text was corrected.
+
+**How reliable is optimal portfolio theory in practice?** Portfolio theory is a valuable discipline but an
+unreliable forecasting machine. *Estimation error* is the biggest problem: expected returns are so imprecise
+(A2) that an optimiser treating them as exact tends to over-invest in stocks whose past returns were lucky. Mary's
+uncapped optimum, which put `r fmt(100 * max(w_mary_uncapped), 1)`% in `r names(which.max(w_mary_uncapped))`
+(Table B3.2), shows how quickly the mathematics produces concentrated bets. *Changing correlations* weaken
+diversification exactly when it is needed: COP and SLB both had their worst month in March 2020. *Non-normality*
+means variance understates the risk of extreme losses (A2). *Out-of-sample performance* differed from the
+estimates: realised household volatility was `r fmt(vol_ratio["Household"])` times its prediction (J3). The
+theory is most useful when its outputs are treated as a starting point and constrained by judgement.
+
+**What we learned, and the decisions that needed human judgement.** Working with real data showed that even
+data preparation involves judgement: ticker histories, thinly traded months and incomplete months all needed
+decisions and documentation. The optimisation itself was mechanical, but several key decisions were not: using
+minimum variance for John so that unreliable return estimates played no part in his portfolio; imposing a 30%
+cap so that no single company could dominate a retiree's savings; choosing λ = `r lambda_mary` for Mary; keeping
+the validation data untouched until all weights were frozen; and recognising that an equity-only portfolio cannot
+truly preserve capital without a cash or bond reserve. The most important was the compromise parameter
+α = `r alpha_h`. No formula can say how much John's preferences should count relative to Mary's; that is a
+conversation with the clients, which the frontier in Table J2.1 is designed to support.
+
+# Group Contribution Statement
+
+Chanda Bhargav Raj (Student 1, 23752009) completed A1–A3: the return and volatility analysis, the confidence
+intervals and normality tests, and John's minimum-variance portfolio. Ramkumar Arumugam (Student 2, 23811719)
+completed B1–B3: the dependence and diversification analysis, the covariance matrix and Hotelling's T² test, and
+Mary's growth portfolio. We completed J1–J4 and the Project Report together. Each student re-ran the other's code
+from the shared data snapshot and confirmed that the results matched; key outputs were also checked
+independently, as described in the J4 reflection. Both students reviewed the final submission and take joint 
+responsibility for it.
